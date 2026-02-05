@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>API Settings Test</title>
+</head>
+
+<body>
+    <h1>API Settings Test</h1>
+    <button onclick="testSettings()">Test Get Settings</button>
+    <pre id="result"></pre>
+
+    <script>
+        async function testSettings() {
+            const result = document.getElementById('result');
+            result.textContent = 'Loading...';
+
+            try {
+                // Test 1: Direct API call
+                const response = await fetch('/api/settings');
+                const settings = await response.json();
+                result.textContent = 'Direct API call result:\n' + JSON.stringify(settings, null, 2);
+
+                // Test 2: Using global helper
+                if (window.getAISettings) {
+                    const helperSettings = await window.getAISettings();
+                    result.textContent += '\n\nHelper function result:\n' + JSON.stringify(helperSettings, null, 2);
+                } else {
+                    result.textContent += '\n\nERROR: window.getAISettings not found!';
+                }
+            } catch (error) {
+                result.textContent = 'Error: ' + error.message;
+            }
+        }
+    </script>
+</body>
+
+</html>

@@ -1,0 +1,10 @@
+node_modules
+database.db
+backups
+.git
+logs
+*.log
+data
+node
+temp_upload_*.db
+server.log

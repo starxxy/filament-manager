@@ -1,0 +1,12 @@
+version: '3'
+services:
+  filament-manager:
+    # 请将 'your_username' 替换为你的 Docker Hub 用户名
+    image: stary19/filament-manager:latest
+    container_name: filament-manager
+    ports:
+      - "2333:3000"
+    volumes:
+      - ./data:/app/data
+      - ./server.log:/app/server.log
+    restart: unless-stopped

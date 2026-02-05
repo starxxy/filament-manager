@@ -1,0 +1,12 @@
+version: '3'
+services:
+  filament-manager:
+    build: .
+    container_name: filament-manager
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./database.db:/app/database.db
+      - ./backups:/app/backups
+      - ./server.log:/app/server.log
+    restart: unless-stopped

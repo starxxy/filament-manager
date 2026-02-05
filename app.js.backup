@@ -1,0 +1,995 @@
+// --- 1. 核心数据驱动 ---
+const db = new Dexie("FilamentPro_V3");
+db.version(4).stores({
+  filaments: "++id, brand, type, color, status, createdAt",
+  brands: "++id, name",
+  types: "++id, brand, typeName",
+  channels: "++id, name"
+}).upgrade(async tx => {
+  // 迁移：为缺失 createdAt 的旧条目补齐时间戳
+  await tx.table("filaments").toCollection().modify(f => {
+    if (!f.createdAt) f.createdAt = Date.now();
+  });
+});
+
+// 初始化静态默认值
+async function initDefaults() {
+  const brandCount = await db.brands.count();
+  if (brandCount === 0) {
+    await db.brands.bulkAdd([{ name: "eSUN" }, { name: "Bambu Lab" }, { name: "Generic" }]);
+    await db.types.bulkAdd([
+      { brand: "Generic", typeName: "PLA", minNozzle: 190, maxNozzle: 220, minBed: 50, maxBed: 60 },
+      { brand: "Generic", typeName: "PETG", minNozzle: 220, maxNozzle: 240, minBed: 70, maxBed: 80 },
+      { brand: "Generic", typeName: "ABS", minNozzle: 240, maxNozzle: 260, minBed: 90, maxBed: 110 }
+    ]);
+  }
+  const channelCount = await db.channels.count();
+  if (channelCount === 0) {
+    await db.channels.bulkAdd([{ name: "淘宝" }, { name: "京东" }, { name: "拼多多" }, { name: "闲鱼" }, { name: "官方网站" }]);
+  }
+}
+
+// Init View Mode on Load
+document.addEventListener('DOMContentLoaded', () => {
+  // Call initViewMode if DOM is ready, or just call it directly since script is at bottom
+  if (typeof initViewMode === 'function') initViewMode();
+});
+
+// --- 2. 状态变量 ---
+let stream = null;
+let currentSourceImg = null;
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+// 缓存 DOM 引用 (脚本在 body 底部，可直接初始化)
+const runOcrBtn = document.getElementById('btn-run-ocr');
+const ocrStatus = document.getElementById('ocr-status-msg');
+
+// --- 3. UI 切换控制 ---
+let currentViewMode = localStorage.getItem('view_mode') || 'grid';
+
+function initViewMode() {
+  toggleViewMode(currentViewMode);
+}
+
+function toggleViewMode(mode) {
+  currentViewMode = mode;
+  localStorage.setItem('view_mode', mode);
+
+  const grid = document.getElementById('filament-grid');
+  const btnGrid = document.getElementById('btn-view-grid');
+  const btnList = document.getElementById('btn-view-list');
+
+  if (mode === 'list') {
+    grid.classList.add('list-view');
+    btnList.classList.add('active');
+    btnGrid.classList.remove('active');
+  } else {
+    grid.classList.remove('list-view');
+    btnGrid.classList.add('active');
+    btnList.classList.remove('active');
+  }
+}
+
+function switchTab(tab) {
+  document.getElementById('page-inventory').style.display = tab === 'inventory' ? 'block' : 'none';
+  document.getElementById('page-config').style.display = tab === 'config' ? 'block' : 'none';
+
+  if (tab === 'inventory') renderFilaments();
+  else renderConfig();
+}
+
+function openAddModal(item = null) {
+  // 状态重置与编辑模式判断
+  currentSourceImg = null;
+  document.getElementById('modal-title').innerText = item ? '编辑耗材信息' : '添加新耗材';
+  document.getElementById('btn-save-filament').dataset.editId = item ? item.id : '';
+
+  // 重置 UI 显示
+  document.getElementById('img-preview').style.display = 'none';
+  const videoPreview = document.getElementById('video-preview');
+  videoPreview.style.display = 'block';
+  document.getElementById('ai-debug-container').style.display = 'none';
+  document.getElementById('ai-raw-output').innerText = '';
+
+  ocrStatus.innerText = '等待图片上传...';
+  ocrStatus.style.color = 'var(--accent-blue)';
+  runOcrBtn.disabled = true;
+  runOcrBtn.style.opacity = '0.5';
+
+  // 填充/重置字段
+  document.getElementById('entry-brand').value = item ? item.brand : '';
+  document.getElementById('entry-type').value = item ? item.type : '';
+  document.getElementById('entry-color').value = item ? (item.color || '') : '';
+  document.getElementById('entry-weight').value = item ? (item.weight || '') : '';
+  document.getElementById('entry-status').value = item ? item.status : 'Sealed';
+  document.getElementById('entry-nozzle-min').value = item ? (item.minNozzle || '') : '';
+  document.getElementById('entry-nozzle-max').value = item ? (item.maxNozzle || '') : '';
+  document.getElementById('entry-bed-min').value = item ? (item.minBed || '') : '';
+  document.getElementById('entry-bed-max').value = item ? (item.maxBed || '') : '';
+
+  // 新字段
+  document.getElementById('entry-purchase-date').value = item ? (item.purchaseDate || '') : new Date().toISOString().split('T')[0];
+  document.getElementById('entry-purchase-price').value = item ? (item.purchasePrice || '') : '';
+  document.getElementById('entry-purchase-channel').value = item ? (item.purchaseChannel || '') : '';
+
+  // 记录并显示识别图片/存档图片
+  window.lastIdentifiedImg = item ? item.imageBlob : null;
+  const savedImgContainer = document.getElementById('modal-img-saved-container');
+  const savedImgPreview = document.getElementById('modal-img-saved');
+
+  if (window.lastIdentifiedImg) {
+    savedImgPreview.style.backgroundImage = `url(${window.lastIdentifiedImg})`;
+    savedImgContainer.style.display = 'block';
+  } else {
+    savedImgContainer.style.display = 'none';
+  }
+
+  document.getElementById('modal-overlay').style.display = 'flex';
+  updateAllSelects().then(() => {
+    if (item) {
+      document.getElementById('entry-brand').value = item.brand;
+      document.getElementById('entry-type').value = item.type;
+    }
+    // Update clear icons for initial state
+    updateClearIconVisibility('brand');
+    updateClearIconVisibility('type');
+    updateClearIconVisibility('channel');
+  });
+
+  if (!item) {
+    if (isMobile) {
+      // 移动端不自动开启实时摄像头，节省资源并避免权限弹窗干扰
+      video.style.display = 'none';
+      ocrOverlay.style.display = 'none';
+      ocrStatus.innerText = '等待拍照或上传...';
+    } else {
+      startCamera();
+    }
+  }
+}
+
+function closeAddModal() {
+  stopCamera();
+  document.getElementById('modal-overlay').style.display = 'none';
+}
+
+function viewFullImage() {
+  if (window.lastIdentifiedImg) {
+    document.getElementById('full-image-display').src = window.lastIdentifiedImg;
+    document.getElementById('image-viewer-modal').style.display = 'flex';
+  } else {
+    alert("暂无图片可供查看");
+  }
+}
+
+function closeImageModal() {
+  document.getElementById('image-viewer-modal').style.display = 'none';
+}
+
+function setFilterAndRender(field, value) {
+  const el = document.getElementById(`filter-${field}`);
+  if (el) {
+    // 切换逻辑：如果点击的是已经激活的，则取消筛选
+    if (el.value === value) el.value = '';
+    else el.value = value;
+
+    renderFilaments();
+    // 自动滚动到列表顶部以便观察变化
+    document.querySelector('main').scrollTo({ top: 0, behavior: 'smooth' });
+  }
+}
+
+function handlePillClick(field, value) {
+  setFilterAndRender(field, value);
+}
+
+function getDropdownInputId(key) {
+  return key === 'channel' ? 'entry-purchase-channel' : `entry-${key}`;
+}
+
+function clearDropdownInput(key, event) {
+  if (event) event.stopPropagation(); // Prevent triggering other clicks
+  const input = document.getElementById(getDropdownInputId(key));
+  if (input) {
+    input.value = '';
+    input.focus();
+  }
+  // Update icon visibility
+  updateClearIconVisibility(key);
+  // Show full dropdown
+  openDropdown(key, true);
+}
+
+function updateClearIconVisibility(key) {
+  const input = document.getElementById(getDropdownInputId(key));
+  if (!input) return;
+  const val = input.value;
+  const icon = document.getElementById(`clear-${key}`);
+  if (icon) icon.style.display = val ? 'block' : 'none';
+}
+
+// 辅助：颜色映射
+function getColorHex(colorName) {
+  if (!colorName) return '#eee';
+  const name = colorName.trim();
+  const map = {
+    '红色': '#ff4d4f', '橙色': '#ffa940', '黄色': '#ffec3d', '绿色': '#73d13d',
+    '青色': '#36cfc9', '蓝色': '#40a9ff', '紫色': '#9254de', '黑色': '#262626',
+    '白色': '#ffffff', '灰色': '#8c8c8c', '粉色': '#ff85c0', '棕色': '#873800',
+    '金': '#ffc53d', '银': '#bfbfbf', '透明': 'rgba(255,255,255,0.3)',
+    'Red': '#ff4d4f', 'Blue': '#40a9ff', 'Black': '#262626', 'White': '#ffffff'
+  };
+  return map[name] || '#eee';
+}
+
+// --- 4. 摄像头与 OCR 逻辑 ---
+const video = document.getElementById('video-preview');
+const ocrOverlay = document.getElementById('ocr-overlay');
+
+async function startCamera() {
+  // 在移动端，我们不再尝试使用 getUserMedia 实时预览，因为它在很多浏览器和非 HTTPS 下不稳定
+  // 改为直接引导用户使用点击按钮后的原生拍照
+  if (isMobile) {
+    video.style.display = 'none';
+    ocrOverlay.style.display = 'none';
+    ocrStatus.innerText = '请点击“拍照识别”或“上传图片”';
+    return;
+  }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    console.warn("getUserMedia not supported");
+    return;
+  }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+    video.style.display = 'block';
+    video.srcObject = stream;
+    video.play();
+    ocrOverlay.style.display = 'block';
+    document.getElementById('img-preview').style.display = 'none';
+  } catch (err) {
+    console.error("Camera access failed:", err);
+  }
+}
+
+function triggerNativeCamera() {
+  // 回退方案：直接触发 native input
+  document.getElementById('input-camera-native').click();
+}
+
+function stopCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = null;
+  ocrOverlay.style.display = 'none';
+}
+
+// --- 移除已失效的 btn-snap 监听 ---
+
+// 已合并至 HTML 内联调用，此处移除冗余监听
+
+// 已合并至 input-camera-native，此处移除冗余监听
+
+// ... handleImageFile will use ocrStatus/runOcrBtn
+
+function handleImageFile(files, autoOCR = false) {
+  const file = files[0];
+  if (!file) return;
+
+  // 停止现有摄像头流 (如果有)
+  if (stream) stopCamera();
+
+  ocrStatus.innerText = '⌛ 正在加载预览图...';
+  ocrStatus.style.color = 'var(--accent-blue)';
+
+  const reader = new FileReader();
+  reader.onerror = () => {
+    ocrStatus.innerText = '❌ 图片加载失败，请重试';
+    ocrStatus.style.color = 'var(--danger)';
+  };
+
+  reader.onload = (ev) => {
+    const img = new Image();
+    img.onerror = () => {
+      ocrStatus.innerText = '❌ 无效的图片文件';
+      ocrStatus.style.color = 'var(--danger)';
+    };
+    img.onload = () => {
+      currentSourceImg = img;
+      const preview = document.getElementById('img-preview');
+      preview.style.backgroundImage = `url(${ev.target.result})`;
+      preview.style.display = 'block';
+
+      // 关键：选图后同步更新存档预览图 & 记录大图查看路径
+      window.lastIdentifiedImg = ev.target.result;
+      const savedImgContainer = document.getElementById('modal-img-saved-container');
+      const savedImgPreview = document.getElementById('modal-img-saved');
+      savedImgPreview.style.backgroundImage = `url(${window.lastIdentifiedImg})`;
+      savedImgContainer.style.display = 'block';
+
+      // 关键：隐藏视频和扫描线遮罩
+      video.style.display = 'none';
+      ocrOverlay.style.display = 'none';
+
+      // 允许点击重新分析
+      runOcrBtn.disabled = false;
+      runOcrBtn.style.opacity = '1';
+      ocrStatus.innerText = '✅ 图片就绪';
+      ocrStatus.style.color = 'var(--accent-color)';
+
+      // 如果启用自动 OCR 则立即执行
+      if (autoOCR) {
+        processOCR(img);
+      }
+    };
+    img.src = ev.target.result;
+  };
+  reader.readAsDataURL(file);
+}
+
+// 供“重新识别”按钮调用
+function processOCRFromCurrent() {
+  if (currentSourceImg) {
+    processOCR(currentSourceImg);
+  } else if (stream) {
+    processOCR(video);
+  } else {
+    ocrStatus.innerText = '⚠️ 请先获取图片';
+  }
+}
+
+// 已合并至 HTML 内联调用
+
+async function processOCR(source) {
+  ocrStatus.innerText = '⚡ AI 正在深度分析中...';
+  ocrStatus.style.color = 'var(--accent-purple)';
+  runOcrBtn.disabled = true;
+  runOcrBtn.style.opacity = '0.5';
+
+  ocrOverlay.style.borderWidth = '4px';
+  ocrOverlay.style.borderColor = '#fff';
+  ocrOverlay.style.boxShadow = '0 0 30px #fff';
+
+  // 图像预处理辅助函数：增强对比度并进行旋转
+  const preprocessImage = (angle) => {
+    const tmpCanvas = document.createElement('canvas');
+    const tmpCtx = tmpCanvas.getContext('2d');
+    const origWidth = source.videoWidth || source.width;
+    const origHeight = source.videoHeight || source.height;
+
+    if (angle === 90 || angle === 270) {
+      tmpCanvas.width = origHeight;
+      tmpCanvas.height = origWidth;
+    } else {
+      tmpCanvas.width = origWidth;
+      tmpCanvas.height = origHeight;
+    }
+
+    tmpCtx.save();
+    // 关键优化：图像增强（灰度+高对比度+亮度提升）
+    tmpCtx.filter = 'grayscale(100%) contrast(150%) brightness(110%)';
+
+    if (angle !== 0) {
+      tmpCtx.translate(tmpCanvas.width / 2, tmpCanvas.height / 2);
+      tmpCtx.rotate(angle * Math.PI / 180);
+      if (angle === 90 || angle === 270) {
+        tmpCtx.drawImage(source, -origWidth / 2, -origHeight / 2, origWidth, origHeight);
+      } else { // For 180 degrees, if ever needed
+        tmpCtx.drawImage(source, -origWidth / 2, -origHeight / 2, origWidth, origHeight);
+      }
+    } else {
+      tmpCtx.drawImage(source, 0, 0, tmpCanvas.width, tmpCanvas.height);
+    }
+    tmpCtx.restore();
+    return tmpCanvas.toDataURL('image/jpeg', 0.8);
+  };
+
+  try {
+    const dataUrl = source.tagName === 'VIDEO' ? preprocessImage(0) : source.src;
+    window.lastIdentifiedImg = dataUrl;
+
+    // 同步更新预览图
+    const savedImgPreview = document.getElementById('modal-img-saved');
+    savedImgPreview.style.backgroundImage = `url(${dataUrl})`;
+    savedImgPreview.style.display = 'block';
+
+    // 关键升级：集成用户配置的 AI 参数
+    const settings = JSON.parse(localStorage.getItem('ai_settings') || '{}');
+    if (!settings.apiKey) {
+      ocrStatus.innerText = '⚠️ 请先在“系统设置”中配置 AI API Key';
+      ocrStatus.style.color = 'var(--danger)';
+      return;
+    }
+
+    const API_KEY = settings.apiKey;
+    const BASE_URL = settings.baseUrl || 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+    const MODEL = settings.modelName || 'qwen-vl-plus-latest';
+    const API_URL = `${BASE_URL}/chat/completions`;
+
+    const response = await fetch(API_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "你是一位精通3D打印耗材识别的 AI 专家。请分析这张标签，并返回严格的 JSON 格式：{brand: '厂家', type: '材质(如PLA/PETG/ABS等)', color: '颜色(中文)', weight: 数字(单位kg), price: 数字(如果能看到价格), minNozzle: 数字, maxNozzle: 数字, minBed: 数字, maxBed: 数字}。提示：厂家和材质请直接根据标签原文识别，不必受限于现有数据库。重点识别 Nozzle/Printing 温度范围。必须仅返回 JSON，不要解释。" },
+            { type: "image_url", image_url: { url: dataUrl } }
+          ]
+        }]
+      })
+    });
+
+    if (!response.ok) throw new Error('AI 服务连接失败');
+
+    const result = await response.json();
+    const rawContent = result.choices[0].message.content;
+
+    document.getElementById('ai-debug-container').style.display = 'block';
+    document.getElementById('ai-raw-output').innerText = rawContent;
+
+    const jsonStr = rawContent.match(/\{[\s\S]*\}/)[0];
+    const aiData = JSON.parse(jsonStr);
+
+    console.log("AI Analysis Result:", aiData);
+
+    // 关键改变：应用预设，但随后使用 AI 识别值覆盖它 (实现 AI 优先级)
+    if (aiData.type) {
+      document.getElementById('entry-type').value = aiData.type.toUpperCase();
+      await applyTypePresets(true); // 先加载数据库默认温度
+    }
+
+    let detectedCount = 0;
+    if (aiData.brand) { document.getElementById('entry-brand').value = aiData.brand; detectedCount++; }
+    if (aiData.color) { document.getElementById('entry-color').value = aiData.color; detectedCount++; }
+    if (aiData.weight) { document.getElementById('entry-weight').value = aiData.weight; detectedCount++; }
+    if (aiData.price) { document.getElementById('entry-purchase-price').value = aiData.price; }
+
+    // AI 识别出的温度具有最高优先级，覆盖 applyTypePresets 加载的值
+    if (aiData.minNozzle) { document.getElementById('entry-nozzle-min').value = aiData.minNozzle; detectedCount++; }
+    if (aiData.maxNozzle) document.getElementById('entry-nozzle-max').value = aiData.maxNozzle;
+    if (aiData.minBed) { document.getElementById('entry-bed-min').value = aiData.minBed; detectedCount++; }
+    if (aiData.maxBed) document.getElementById('entry-bed-max').value = aiData.maxBed;
+
+    if (detectedCount > 0) {
+      ocrStatus.innerText = `✅ AI 分析成功！已提取 ${detectedCount} 项核心参数`;
+      ocrStatus.style.color = 'var(--accent-color)';
+    } else {
+      ocrStatus.innerText = '❌ AI 识别失败：建议切换角度或光照后重试';
+      ocrStatus.style.color = 'var(--danger)';
+    }
+
+  } catch (e) {
+    ocrStatus.innerText = '⚠️ 系统繁忙：识别引擎初始化失败';
+    ocrStatus.style.color = 'var(--danger)';
+    console.error(e);
+  } finally {
+    ocrOverlay.style.borderWidth = '1px';
+    ocrOverlay.style.borderColor = 'var(--accent-blue)';
+    ocrOverlay.style.boxShadow = 'none';
+    runOcrBtn.disabled = false;
+    runOcrBtn.style.opacity = '1';
+    if (stream && isMobile) stopCamera();
+  }
+}
+
+// --- 5. 数据联动 ---
+async function applyTypePresets(isAIPriority = false) {
+  const typeName = document.getElementById('entry-type').value;
+  const brandName = document.getElementById('entry-brand').value;
+
+  let config = await db.types.where({ brand: brandName, typeName: typeName }).first();
+  if (!config) config = await db.types.where({ brand: "Generic", typeName: typeName }).first();
+
+  if (config) {
+    // 如果是手动选择导致的触发，或者当前字段为空，则填充
+    const fields = [
+      { id: 'entry-nozzle-min', val: config.minNozzle },
+      { id: 'entry-nozzle-max', val: config.maxNozzle },
+      { id: 'entry-bed-min', val: config.minBed },
+      { id: 'entry-bed-max', val: config.maxBed }
+    ];
+
+    fields.forEach(f => {
+      const el = document.getElementById(f.id);
+      if (!isAIPriority || !el.value) { // 只有在非 AI 优先模式，或者字段为空时才应用预设
+        el.value = f.val;
+      }
+    });
+  }
+}
+
+async function updateAllSelects() {
+  const brands = await db.brands.toArray();
+  const types = await db.types.toArray();
+
+  // 关键：按拼音首字母排序 (Case-insensitive)
+  brands.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+  const uniqueTypes = [...new Set(types.map(t => t.typeName))].sort((a, b) => a.localeCompare(b, 'zh'));
+
+  // 1. 填充 Custom Dropdowns
+  populateCustomDropdown('brand', brands.map(b => b.name));
+  populateCustomDropdown('type', uniqueTypes);
+
+  const channels = await db.channels.toArray();
+  channels.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+  populateCustomDropdown('channel', channels.map(c => c.name));
+
+  // 2. 填充 传统的 selects (设置页和过滤器)
+  const bSelectHtml = brands.map(b => `<option value="${b.name}">${b.name}</option>`).join('');
+  const tSelectHtml = uniqueTypes.map(t => `<option value="${t}">${t}</option>`).join('');
+
+  // 关键：获取所有现有颜色用于过滤
+  const allFilaments = await db.filaments.toArray();
+  const uniqueColors = [...new Set(allFilaments.map(f => f.color || '常规色'))].sort((a, b) => a.localeCompare(b, 'zh'));
+  const cSelectHtml = uniqueColors.map(c => `<option value="${c}">${c}</option>`).join('');
+
+  document.getElementById('conf-brand').innerHTML = bSelectHtml;
+  const fBrand = document.getElementById('filter-brand');
+  const fType = document.getElementById('filter-type');
+  const fColor = document.getElementById('filter-color');
+
+  if (fBrand) fBrand.innerHTML = '<option value="">所有品牌</option>' + bSelectHtml;
+  if (fType) fType.innerHTML = '<option value="">所有材质</option>' + tSelectHtml;
+  if (fColor) fColor.innerHTML = '<option value="">所有颜色</option>' + cSelectHtml;
+}
+
+// --- 5.1 Custom Dropdown Logic ---
+let dropdownData = { brand: [], type: [], channel: [] };
+
+function populateCustomDropdown(key, items) {
+  dropdownData[key] = items;
+  renderDropdownItems(key, items);
+}
+
+function renderDropdownItems(key, items) {
+  const ul = document.getElementById(`dropdown-${key}`);
+  if (!ul) return;
+
+  if (items.length === 0) {
+    ul.innerHTML = `<li style="color:var(--text-muted); padding:8px; cursor:default;">无匹配项</li>`;
+  } else {
+    ul.innerHTML = items.map(item =>
+      `<li onmousedown="selectDropdownItem('${key}', '${item}')">${item}</li>`
+    ).join('');
+    // Note: use onmousedown to fire before blur
+  }
+}
+
+function filterDropdown(key) {
+  const input = document.getElementById(getDropdownInputId(key));
+  if (!input) return;
+  const query = input.value.toLowerCase();
+  updateClearIconVisibility(key); // Update clear icon
+  const filtered = dropdownData[key].filter(item => item.toLowerCase().includes(query));
+  renderDropdownItems(key, filtered);
+  document.getElementById(`${key}-wrapper`).classList.add('active');
+}
+
+function toggleDropdown(key) {
+  const wrapper = document.getElementById(`${key}-wrapper`);
+  if (wrapper.classList.contains('active')) closeDropdown(key);
+  else {
+    openDropdown(key, true); // Force show all on click
+    document.getElementById(`entry-${key}`).focus();
+  }
+}
+
+function openDropdown(key, forceShowAll = false) {
+  // Close others
+  ['brand', 'type', 'channel'].forEach(k => { if (k !== key) closeDropdown(k); });
+
+  const wrapper = document.getElementById(`${key}-wrapper`);
+  wrapper.classList.add('active');
+
+  const val = document.getElementById(getDropdownInputId(key)).value;
+  // If forced (click/focus) OR empty, show all. Otherwise filter.
+  if (forceShowAll || !val) {
+    renderDropdownItems(key, dropdownData[key]);
+  } else {
+    filterDropdown(key);
+  }
+}
+
+function closeDropdown(key) {
+  document.getElementById(`${key}-wrapper`).classList.remove('active');
+}
+
+function delayCloseDropdown(key) {
+  setTimeout(() => closeDropdown(key), 200);
+}
+
+function selectDropdownItem(key, value) {
+  const input = document.getElementById(getDropdownInputId(key));
+  if (input) {
+    input.value = value;
+    updateClearIconVisibility(key); // Update clear icon
+  }
+
+  // Trigger change events if needed
+  if (key === 'type') applyTypePresets();
+  closeDropdown(key);
+}
+
+function clearFilters() {
+  const fields = ['filter-brand', 'filter-type', 'filter-color', 'filter-status', 'filter-channel'];
+  fields.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  renderFilaments();
+}
+
+// --- 6. 耗材渲染与操作 ---
+async function renderFilaments() {
+  const getVal = (id) => document.getElementById(id)?.value || '';
+  const brand = getVal('filter-brand');
+  const type = getVal('filter-type');
+  const color = getVal('filter-color');
+  const status = getVal('filter-status');
+  const channel = getVal('filter-channel');
+
+  let items = [];
+  try {
+    // 优先使用索引排序
+    items = await db.filaments.orderBy('createdAt').reverse().toArray();
+  } catch (err) {
+    console.warn("IndexedDB 排序查询失败，尝试内存排序:", err);
+    // 兜底方案：先取全量数据，再在 JS 中手动排序 (防止旧版本索引残留导致的加载失败)
+    items = await db.filaments.toArray();
+    items.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  }
+
+  if (brand) items = items.filter(i => i.brand === brand);
+  if (type) items = items.filter(i => i.type === type);
+  if (color) items = items.filter(i => (i.color || '常规色') === color);
+  if (status) items = items.filter(i => i.status === status);
+  if (channel) items = items.filter(i => (i.purchaseChannel || '') === channel);
+
+  const brandMap = {};
+  const typeMap = {};
+  const colorMap = {};
+  const channelMap = {};
+  items.forEach(i => {
+    const b = i.brand || '未知品牌';
+    const t = i.type || '未知材质';
+    const c = i.color || '常规色';
+    const ch = i.purchaseChannel || '未知渠道';
+    brandMap[b] = (brandMap[b] || 0) + 1;
+    typeMap[t] = (typeMap[t] || 0) + 1;
+    colorMap[c] = (colorMap[c] || 0) + 1;
+    channelMap[ch] = (channelMap[ch] || 0) + 1;
+  });
+
+  // 1. 更新顶部核心指标卡片
+  document.getElementById('stat-total-count').innerText = items.length;
+  document.getElementById('stat-inuse-count').innerText = items.filter(i => i.status === 'InUse').length;
+  document.getElementById('stat-finished-count').innerText = items.filter(i => i.status === 'Finished').length;
+
+  const totalValue = items.reduce((sum, item) => sum + (parseFloat(item.purchasePrice) || 0), 0);
+  document.getElementById('stat-total-value').innerText = `¥${totalValue.toFixed(2)}`;
+
+  // 2. 更新分类统计药丸标签
+  const renderPills = (containerId, dataMap, filterField) => {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    container.innerHTML = Object.entries(dataMap).map(([name, count]) => {
+      const filterEl = document.getElementById(`filter-${filterField}`);
+      const activeClass = filterEl && filterEl.value === name ? 'active' : '';
+      return `
+        <div class="pill-label ${activeClass}" onclick="handlePillClick('${filterField}', '${name}')">
+          ${filterField === 'color' ? `<span style="width:10px; height:10px; border-radius:50%; background:${getColorHex(name)}; border:1px solid rgba(0,0,0,0.1);"></span>` : ''}
+          ${name} <span class="count">${count}</span>
+        </div>
+      `;
+    }).join('');
+  };
+
+  renderPills('class-brand', brandMap, 'brand');
+  renderPills('class-type', typeMap, 'type');
+  renderPills('class-color', colorMap, 'color');
+  renderPills('class-channel', channelMap, 'channel');
+
+  const grid = document.getElementById('filament-grid');
+  grid.innerHTML = items.map(f => `
+    <div class="card-v3 filament-card">
+      ${f.imageBlob ? `
+        <div class="card-image" style="background-image: url(${f.imageBlob});"></div>
+      ` : '<div class="card-image placeholder"></div>'}
+      <div class="card-content">
+        <div class="card-header">
+          <div>
+            <h4 class="filament-title">${f.brand} ${f.type}</h4>
+            <p class="filament-subtitle">${f.color || '常规色'}</p>
+          </div>
+          <span class="status-label ${f.status === 'InUse' ? 'status-in-use' : (f.status === 'Finished' ? 'status-finished' : 'status-sealed')}">
+            ${f.status === 'InUse' ? '使用中' : (f.status === 'Finished' ? '已耗尽' : '全新')}
+          </span>
+        </div>
+        <div class="card-details">
+          <div class="detail-item">
+            <i data-lucide="thermometer"></i>
+            <span>参数: ${f.minNozzle}-${f.maxNozzle}℃ / ${f.minBed}-${f.maxBed}℃</span>
+          </div>
+          <div class="detail-item">
+            <i data-lucide="shopping-cart"></i>
+            <span>渠道: ${f.purchaseChannel || '未知'} · ¥${f.purchasePrice || '--'}</span>
+          </div>
+          <div class="detail-item">
+            <i data-lucide="scale"></i>
+            <span>重量: ${f.weight || '1.0'} kg</span>
+          </div>
+          <div class="detail-item">
+            <i data-lucide="clock"></i>
+            <span>入库: ${f.purchaseDate || '未知'}</span>
+          </div>
+        </div>
+      </div>
+      <div class="card-actions">
+        <button class="action-btn" onclick="editFilament(${f.id})">编辑</button>
+        <button class="action-btn" onclick="updateStatus(${f.id}, 'InUse')">使用</button>
+        <button class="action-btn" onclick="updateStatus(${f.id}, 'Finished')">耗尽</button>
+        <button class="action-btn btn-danger" onclick="deleteFilament(${f.id})"><i data-lucide="trash-2" style="width:14px;"></i></button>
+      </div>
+    </div>
+  `).join('');
+  lucide.createIcons();
+}
+
+async function updateStatus(id, status) {
+  await db.filaments.update(id, { status });
+  renderFilaments();
+}
+
+async function deleteFilament(id) {
+  if (confirm("删除该耗材记录？")) {
+    await db.filaments.delete(id);
+    renderFilaments();
+  }
+}
+
+async function editFilament(id) {
+  const item = await db.filaments.get(id);
+  if (item) {
+    openAddModal(item);
+  }
+}
+
+// --- 7. 配置管理 ---
+async function renderConfig() {
+  const brands = await db.brands.toArray();
+  document.getElementById('brand-list').innerHTML = brands.map(b => `
+    <span class="status-label" style="background: rgba(255,255,255,0.05); border: 1px solid var(--border-color); display:flex; align-items:center; gap:6px;">
+      ${b.name} <i data-lucide="x" style="width:12px; cursor:pointer;" onclick="deleteBrand(${b.id})"></i>
+    </span>
+  `).join('');
+
+  const types = await db.types.toArray();
+  document.getElementById('type-config-list').innerHTML = types.map(t => `
+    <div style="padding:12px; border-bottom:1px solid var(--border-color); display:flex; justify-content:space-between; align-items:center;">
+      <div>
+        <p style="font-size: 14px; font-weight:600;">${t.brand} - ${t.typeName}</p>
+        <p style="font-size: 11px; color:var(--text-muted)">温度: ${t.minNozzle}-${t.maxNozzle} / ${t.minBed}-${t.maxBed}℃</p>
+      </div>
+      <i data-lucide="minus-circle" style="width:16px; color:var(--danger); cursor:pointer;" onclick="deleteType(${t.id})"></i>
+    </div>
+  `).join('');
+  lucide.createIcons();
+}
+
+async function addBrand() {
+  const name = document.getElementById('new-brand-name').value.trim();
+  if (name) { await db.brands.add({ name }); document.getElementById('new-brand-name').value = ''; renderConfig(); }
+}
+async function deleteBrand(id) { await db.brands.delete(id); renderConfig(); }
+async function showAddTypeModal() {
+  updateAllSelects();
+  document.getElementById('type-modal-v3').style.display = 'flex';
+}
+async function saveTypeConfig() {
+  const conf = {
+    brand: document.getElementById('conf-brand').value,
+    typeName: document.getElementById('conf-type-name').value.toUpperCase(),
+    minNozzle: parseInt(document.getElementById('conf-min-nozzle').value),
+    maxNozzle: parseInt(document.getElementById('conf-max-nozzle').value),
+    minBed: parseInt(document.getElementById('conf-min-bed').value),
+    maxBed: parseInt(document.getElementById('conf-max-bed').value)
+  };
+  await db.types.add(conf);
+  document.getElementById('type-modal-v3').style.display = 'none';
+  renderConfig();
+}
+async function deleteType(id) { await db.types.delete(id); renderConfig(); }
+
+// --- 8. 初始化入口 ---
+document.getElementById('btn-save-filament').onclick = async function () {
+  const editId = this.dataset.editId;
+  const brand = document.getElementById('entry-brand').value.trim();
+  const type = document.getElementById('entry-type').value.trim();
+  const channel = document.getElementById('entry-purchase-channel').value.trim();
+
+  if (!brand || !type) {
+    alert("请填写品牌和材质");
+    return;
+  }
+
+  const item = {
+    brand: brand,
+    type: type,
+    color: document.getElementById('entry-color').value,
+    weight: parseFloat(document.getElementById('entry-weight').value) || 1.0,
+    minNozzle: parseInt(document.getElementById('entry-nozzle-min').value) || 200,
+    maxNozzle: parseInt(document.getElementById('entry-nozzle-max').value) || 230,
+    minBed: parseInt(document.getElementById('entry-bed-min').value) || 50,
+    maxBed: parseInt(document.getElementById('entry-bed-max').value) || 70,
+    status: document.getElementById('entry-status').value,
+    purchaseDate: document.getElementById('entry-purchase-date').value,
+    purchasePrice: document.getElementById('entry-purchase-price').value,
+    purchaseChannel: channel,
+    imageBlob: window.lastIdentifiedImg, // 保存被识别的图片
+    createdAt: editId ? undefined : Date.now()
+  };
+
+  if (editId) {
+    const oldItem = await db.filaments.get(parseInt(editId));
+    item.id = parseInt(editId);
+    if (!item.createdAt) item.createdAt = oldItem.createdAt;
+    // 如果没有新识别图片且是编辑状态，保留旧图片
+    if (!item.imageBlob) item.imageBlob = oldItem.imageBlob;
+  }
+
+  // 自动同步厂家/材质/渠道到各库
+  const brandExists = await db.brands.where('name').equalsIgnoreCase(brand).first();
+  if (brand && !brandExists) await db.brands.add({ name: brand });
+
+  const channelExists = await db.channels.where('name').equalsIgnoreCase(channel).first();
+  if (channel && !channelExists) await db.channels.add({ name: channel });
+
+  const typeExists = await db.types.where({ brand: brand, typeName: type }).first();
+  if (brand && type && !typeExists) {
+    await db.types.add({
+      brand: brand, typeName: type,
+      minNozzle: item.minNozzle, maxNozzle: item.maxNozzle,
+      minBed: item.minBed, maxBed: item.maxBed
+    });
+  }
+
+  try {
+    await db.filaments.put(item);
+
+    // 清理全局变量，防止下次干扰
+    window.lastIdentifiedImg = null;
+    currentSourceImg = null;
+
+    closeAddModal();
+    // 关键：保存后强制清空筛选，确保新项目立即可见
+    clearFilters();
+    updateAllSelects();
+    console.log("Filament saved successfully");
+  } catch (err) {
+    console.error("Save failed:", err);
+    alert("保存失败: " + err.message);
+  }
+};
+
+document.getElementById('filter-brand').onchange = renderFilaments;
+document.getElementById('filter-type').onchange = renderFilaments;
+document.getElementById('filter-color').onchange = renderFilaments;
+document.getElementById('filter-status').onchange = renderFilaments;
+
+initDefaults().then(() => {
+  updateAllSelects();
+  loadAISettings();
+  switchTab('inventory');
+});
+lucide.createIcons();
+
+// --- 9. AI 配置管理 ---
+function loadAISettings() {
+  const settings = JSON.parse(localStorage.getItem('ai_settings') || '{}');
+  const apiKeyEl = document.getElementById('ai-api-key');
+  const baseUrlEl = document.getElementById('ai-base-url');
+  const modelNameEl = document.getElementById('ai-model-name');
+
+  if (apiKeyEl) {
+    apiKeyEl.value = settings.apiKey || '';
+    // Store real value for toggling
+    apiKeyEl.dataset.realValue = settings.apiKey || '';
+  }
+  if (baseUrlEl) baseUrlEl.value = settings.baseUrl || 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+  if (modelNameEl) modelNameEl.value = settings.modelName || 'qwen-vl-plus-latest';
+}
+
+function toggleApiKeyVisibility() {
+  const input = document.getElementById('ai-api-key');
+  const icon = document.getElementById('btn-toggle-key');
+  const isPassword = input.getAttribute('type') === 'password';
+
+  if (isPassword) {
+    // Switch to Masked View
+    const realVal = input.value;
+    if (!realVal) return;
+
+    input.dataset.realValue = realVal; // Sync latest input
+
+    // Create mask: First 3 + **** + Last 3
+    if (realVal.length > 6) {
+      const mask = realVal.substring(0, 3) + '••••••' + realVal.substring(realVal.length - 3);
+      input.setAttribute('type', 'text');
+      input.value = mask;
+    } else {
+      // Too short to mask nicely, just show plain (or handled differently, but requirement implies long keys)
+      input.setAttribute('type', 'text');
+    }
+
+    input.readOnly = true;
+    icon?.setAttribute('data-lucide', 'eye-off');
+    input.style.color = 'var(--text-muted)';
+  } else {
+    // Switch back to Edit/Password Mode
+    input.value = input.dataset.realValue || '';
+    input.setAttribute('type', 'password');
+    input.readOnly = false;
+    icon.setAttribute('data-lucide', 'eye');
+    input.style.color = 'var(--text-main)';
+  }
+  lucide.createIcons();
+}
+
+async function saveAISettings() {
+  const input = document.getElementById('ai-api-key');
+  // Critical: If in masked (readonly) mode, use the hidden real value. Otherwise use current input.
+  let apiKey = input.readOnly ? (input.dataset.realValue || '') : input.value.trim();
+
+  const baseUrl = document.getElementById('ai-base-url').value.trim() || 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+  const modelName = document.getElementById('ai-model-name').value.trim() || 'qwen-vl-plus-latest';
+  const statusEl = document.getElementById('ai-config-status');
+
+  if (!apiKey) {
+    showAIStatus('请输入 API Key', 'error');
+    return;
+  }
+
+  showAIStatus('正在验证配置...', 'info');
+
+  try {
+    const response = await fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: modelName,
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 5
+      })
+    });
+
+    if (response.ok) {
+      localStorage.setItem('ai_settings', JSON.stringify({ apiKey, baseUrl, modelName }));
+      // Update the dataset so subsequent toggles use the new saved key
+      input.dataset.realValue = apiKey;
+      showAIStatus('验证成功并已保存！', 'success');
+    } else {
+      const errorData = await response.json();
+      showAIStatus(`验证失败: ${errorData.error?.message || '请检查配置'}`, 'error');
+    }
+  } catch (err) {
+    showAIStatus(`连接失败: ${err.message}`, 'error');
+  }
+}
+
+function showAIStatus(msg, type) {
+  const el = document.getElementById('ai-config-status');
+  if (!el) return;
+  el.style.display = 'block';
+  el.innerText = msg;
+  el.style.background = type === 'success' ? 'rgba(76, 175, 80, 0.1)' : (type === 'error' ? 'rgba(244, 67, 54, 0.1)' : 'rgba(33, 150, 243, 0.1)');
+  el.style.color = type === 'success' ? '#2e7d32' : (type === 'error' ? '#d32f2f' : '#1976d2');
+  el.style.border = `1px solid ${type === 'success' ? '#2e7d32' : (type === 'error' ? '#d32f2f' : '#1976d2')}`;
+}

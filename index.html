@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>FilamentPro - 工业级耗材管理</title>
+  <link rel="stylesheet" href="style.css">
+  <!-- External libs: defer for non-blocking, but Dexie placeholder not needed since we override it -->
+  <script defer src="https://cdn.jsdelivr.net/npm/lucide@latest/dist/umd/lucide.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/tesseract.js@latest/dist/tesseract.min.js"></script>
+  <!-- Our API-backed Dexie MUST load synchronously before app.js -->
+  <script src="api-dexie.js?v=4"></script>
+</head>
+
+<body>
+  <div class="app-wrapper">
+    <header>
+      <div class="header-content">
+        <h1 id="app-title" style="cursor: pointer;" onclick="resetAndGoHome()">3D打印耗材管理系统</h1>
+        <div class="header-actions">
+          <button class="header-btn primary" onclick="openAddModal()">添加耗材</button>
+          <button class="header-btn secondary" onclick="switchTab('config')">系统设置</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- 主展示区 -->
+    <main>
+      <!-- 库存页面 -->
+      <section id="page-inventory">
+        <!-- 4大核心指标卡片 -->
+        <div class="stats-overview" id="stats-summary">
+          <div class="stat-card">
+            <h2 id="stat-total-count">0</h2>
+            <p>总数量</p>
+          </div>
+          <div class="stat-card">
+            <h2 id="stat-inuse-count">0</h2>
+            <p>在用数量</p>
+          </div>
+          <div class="stat-card">
+            <h2 id="stat-finished-count">0</h2>
+            <p>已消耗数量</p>
+          </div>
+          <div class="stat-card">
+            <h2 id="stat-total-value">¥0.00</h2>
+            <p>总价值</p>
+          </div>
+        </div>
+
+        <!-- 分类统计大卡片 -->
+        <div class="card-v3 classification-card">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px;">
+            <h3 style="margin: 0;">分类统计</h3>
+            <button class="header-btn" onclick="clearFilters()"
+              style="background: white; border: 1px solid var(--border-color); color: var(--text-muted); display: flex; align-items: center; gap: 6px; padding: 6px 12px; font-size: 13px;">
+              <i data-lucide="rotate-ccw" style="width: 14px;"></i> 重置筛选
+            </button>
+          </div>
+          <div class="classification-group">
+            <label>品牌</label>
+            <div id="class-brand" class="pill-container"></div>
+          </div>
+          <div class="classification-group">
+            <label>材料类型</label>
+            <div id="class-type" class="pill-container"></div>
+          </div>
+          <div class="classification-group">
+            <label>颜色</label>
+            <div id="class-color" class="pill-container"></div>
+          </div>
+          <div class="classification-group">
+            <label>耗材状态</label>
+            <div id="class-status" class="pill-container"></div>
+          </div>
+          <div class="classification-group">
+            <label>购买地点</label>
+            <div id="class-channel" class="pill-container"></div>
+          </div>
+          <div class="classification-group">
+            <label>保存位置</label>
+            <div id="class-location" class="pill-container"></div>
+          </div>
+        </div>
+
+        <!-- 过滤器与视图切换工具栏 -->
+        <div class="toolbar-v3">
+          <div class="view-toggle-v3">
+            <button id="btn-view-grid" onclick="toggleViewMode('grid')" class="view-btn-v3 active">网格视图</button>
+            <button id="btn-view-list" onclick="toggleViewMode('list')" class="view-btn-v3">列表视图</button>
+          </div>
+          <!-- 隐藏的筛选状态位，供 JS 逻辑记录状态 -->
+          <input type="hidden" id="filter-brand" value="">
+          <input type="hidden" id="filter-type" value="">
+          <input type="hidden" id="filter-color" value="">
+          <input type="hidden" id="filter-status" value="">
+          <input type="hidden" id="filter-channel" value="">
+          <input type="hidden" id="filter-location" value="">
+
+          <div class="toolbar-actions" style="margin-left: auto;">
+            <select id="sort-select" class="sort-select" onchange="renderFilaments()">
+              <option value="default">默认排列 (最新添加)</option>
+              <option value="oldest">购买日期 (最早优先)</option>
+              <option value="newest">购买日期 (最近优先)</option>
+            </select>
+          </div>
+        </div>
+        <div id="filament-grid" class="filament-grid">
+          <!-- 动态渲染卡片 -->
+        </div>
+      </section>
+
+      <!-- 配置页面 -->
+      <section id="page-config" style="display: none;">
+        <div class="filament-grid">
+          <div class="card-v3">
+            <h3 style="margin-bottom: 16px;">品牌库</h3>
+            <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+              <input type="text" id="new-brand-name" placeholder="品牌名称" class="form-field" style="padding: 8px;">
+              <button class="button-add-circle" onclick="addBrand()" style="padding: 8px 16px;">添加</button>
+            </div>
+            <div id="brand-list" style="display: flex; flex-wrap: wrap; gap: 8px;"></div>
+          </div>
+
+          <div class="card-v3">
+            <h3 style="margin-bottom: 16px;">购买渠道库</h3>
+            <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+              <input type="text" id="new-channel-name" placeholder="渠道名称" class="form-field" style="padding: 8px;">
+              <button class="button-add-circle" onclick="addChannel()" style="padding: 8px 16px;">添加</button>
+            </div>
+            <div id="channel-list" style="display: flex; flex-wrap: wrap; gap: 8px;"></div>
+          </div>
+
+          <div class="card-v3">
+            <h3 style="margin-bottom: 16px;">保存位置库</h3>
+            <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+              <input type="text" id="new-location-name" placeholder="位置名称" class="form-field" style="padding: 8px;">
+              <button class="button-add-circle" onclick="addLocation()" style="padding: 8px 16px;">添加</button>
+            </div>
+            <div id="location-list" style="display: flex; flex-wrap: wrap; gap: 8px;"></div>
+          </div>
+
+          <div class="card-v3">
+            <h3 style="margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+              <i data-lucide="brain-circuit" style="width: 20px; color: var(--accent-purple);"></i>
+              AI 智能识别配置
+            </h3>
+            <div class="form-field" style="margin-bottom: 12px;">
+              <label>API Key</label>
+              <div class="input-container">
+                <input type="password" id="ai-api-key" class="form-field" placeholder="输入您的 API Key"
+                  style="padding-right: 36px;">
+                <i data-lucide="eye" id="btn-toggle-key" class="dropdown-icon"
+                  style="pointer-events: auto; cursor: pointer;" onclick="toggleApiKeyVisibility()"></i>
+              </div>
+            </div>
+            <div class="form-field" style="margin-bottom: 12px;">
+              <label>API 基础地址 (Base URL)</label>
+              <input type="text" id="ai-base-url" class="form-field"
+                placeholder="默认: https://dashscope.aliyuncs.com/compatible-mode/v1">
+            </div>
+            <div class="form-field" style="margin-bottom: 12px;">
+              <label>模型名称 (Model Name)</label>
+              <input type="text" id="ai-model-name" class="form-field" placeholder="默认: qwen-vl-plus-latest">
+            </div>
+            <div id="ai-config-status"
+              style="margin-bottom: 16px; font-size: 13px; display: none; padding: 10px; border-radius: 6px;"></div>
+            <button class="button-add-circle" onclick="saveAISettings()"
+              style="width: 100%; justify-content: center; background: var(--accent-purple);">
+              <i data-lucide="check-circle-2"></i> 保存并验证
+            </button>
+            <p style="margin-top: 12px; font-size: 11px; color: var(--text-muted); line-height: 1.4;">
+              注：目前支持兼容 OpenAI 格式的视觉模型（如阿里通义千问 Qwen-VL）。API 信息将安全地存储在本地。
+            </p>
+          </div>
+
+          <div class="card-v3">
+            <h3 style="margin-bottom: 16px;">材质预设</h3>
+            <div id="type-config-list"></div>
+            <button class="button-add-circle" onclick="showAddTypeModal()"
+              style="width: 100%; margin-top: 16px; background: transparent; border: 1px dashed var(--border-color); color: var(--text-muted);">
+              配置新预设
+            </button>
+          </div>
+
+          <!-- 数据库维护卡片 -->
+          <div class="card-v3">
+            <h3 style="margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+              <i data-lucide="database-backup" style="width: 20px; color: var(--accent-blue);"></i>
+              数据库备份与恢复
+            </h3>
+            <!-- 数据库状态卡片容器 -->
+            <div
+              style="background: #f8fafc; padding: 16px; border-radius: 8px; border: 1px solid var(--border-color); margin-bottom: 20px;">
+              <!-- 顶部说明区 -->
+              <div style="margin-bottom: 12px;">
+                <span
+                  style="font-size: 13px; color: var(--text-main); font-weight: 500; display: block; margin-bottom: 4px;">
+                  <i data-lucide="info"
+                    style="width: 14px; display: inline-block; vertical-align: text-bottom; margin-right: 4px;"></i>
+                  系统每月自动备份一次 (当存储占用 > 80% 时自动清理旧备份)
+                </span>
+                <p id="next-backup-time"
+                  style="font-size: 12px; color: var(--text-muted); margin: 0; padding-left: 20px;">
+                  下次自动备份: 计算中...
+                </p>
+              </div>
+
+              <!-- 操作按钮区：横向排列，自动换行 -->
+              <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                <!-- 隐藏的文件上传输入框 -->
+                <input type="file" id="backup-upload-input" accept=".db" style="display: none;"
+                  onchange="uploadBackupFile(this)">
+
+                <!-- 上传按钮 -->
+                <button class="header-btn" onclick="document.getElementById('backup-upload-input').click()"
+                  style="flex: 1; min-width: 140px; justify-content: center; padding: 10px 16px; background: white; border: 1px solid var(--border-color); color: var(--text-main); box-shadow: var(--shadow-sm);">
+                  <i data-lucide="upload" style="width: 16px; margin-right: 6px;"></i> 上传备份
+                </button>
+
+                <!-- 立即备份按钮 -->
+                <button class="header-btn primary" onclick="createBackup()"
+                  style="flex: 1; min-width: 140px; justify-content: center; padding: 10px 16px;">
+                  <i data-lucide="plus-circle" style="width: 16px; margin-right: 6px;"></i> 立即备份
+                </button>
+              </div>
+            </div>
+
+            <div class="table-container" style="max-height: 200px; overflow-y: auto;">
+              <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+                <thead>
+                  <tr style="text-align: left; color: var(--text-muted); border-bottom: 1px solid var(--border-color);">
+                    <th style="padding: 8px;">文件名</th>
+                    <th style="padding: 8px;">大小</th>
+                    <th style="padding: 8px;">时间</th>
+                    <th style="padding: 8px; text-align: right;">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="backup-list">
+                  <!-- JS Rendered -->
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- 系统升级卡片 -->
+          <div class="card-v3">
+            <h3 style="margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+              <i data-lucide="upload-cloud" style="width: 20px; color: var(--accent-purple);"></i>
+              系统升级
+            </h3>
+            <div style="padding: 12px; border: 1px dashed var(--border-color); border-radius: 8px; text-align: center;">
+              <input type="file" id="upgrade-file" accept=".tar.gz" style="display: none;"
+                onchange="handleUpgradeFile(this)">
+              <button class="btn-ghost" onclick="document.getElementById('upgrade-file').click()"
+                style="margin-bottom: 8px;">
+                选择升级包 (.tar.gz)
+              </button>
+              <p id="upgrade-filename" style="font-size: 12px; color: var(--text-muted);">未选择文件</p>
+            </div>
+            <button id="btn-start-upgrade" class="button-add-circle" onclick="startUpgrade()" disabled
+              style="width: 100%; justify-content: center; background: var(--text-muted); pointer-events: none; margin-top: 12px;">
+              开始升级
+            </button>
+          </div>
+
+          <div class="card-v3">
+            <h3 style="margin-bottom: 16px; display: flex; align-items: center; gap: 8px;">
+              <i data-lucide="users" style="width: 20px; color: var(--accent-blue);"></i>
+              关注作者 / 加入社区
+            </h3>
+            <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 20px; line-height: 1.6;">
+              如果觉得本项目对您有帮助，麻烦点点关注和助力。<br>
+              您的支持是我更新的动力，欢迎给予一定的打赏！
+            </p>
+            <div class="community-grid">
+              <div class="community-item">
+                <div class="qr-container">
+                  <img
+                    src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://space.bilibili.com/50622066"
+                    alt="Bilibili" onclick="openImageModal(this.src)">
+                </div>
+                <p>作者B站</p>
+                <span class="community-sub">在下徐胖胖</span>
+              </div>
+              <div class="community-item">
+                <div class="qr-container">
+                  <img
+                    src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://v.douyin.com/iP6e1y3F/"
+                    alt="Douyin" onclick="openImageModal(this.src)">
+                </div>
+                <p>作者抖音</p>
+                <span class="community-sub">在下徐胖胖</span>
+              </div>
+              <div class="community-item">
+                <div class="qr-container">
+                  <img
+                    src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://makerworld.com.cn/@stary19?appSharePlatform=copy"
+                    alt="MakerWorld" onclick="openImageModal(this.src)">
+                </div>
+                <p>MakerWorld</p>
+                <span class="community-sub">Stary19</span>
+              </div>
+              <div class="community-item">
+                <div class="qr-container">
+                  <img
+                    src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://github.com/starxxy/filament-manager"
+                    alt="GitHub" onclick="openImageModal(this.src)">
+                </div>
+                <p>GitHub主页</p>
+                <span class="community-sub">Starxxy</span>
+              </div>
+              <div class="community-item">
+                <div class="qr-container">
+                  <img src="assets/qr-alipay.jpg" alt="Alipay" onclick="openImageModal(this.src)">
+                </div>
+                <!-- Support styling for donation -->
+                <p style="color: #1677ff;">支付宝打赏</p>
+                <span class="community-sub">小胖的店</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 统一录入面板 -->
+  <div id="modal-overlay" class="modal-overlay">
+    <div class="modal-window">
+      <div class="modal-header">
+        <h2 id="modal-title" style="margin: 0; font-size: 18px; font-weight: 700;">添加新耗材</h2>
+        <button onclick="closeAddModal()"
+          style="background:none; border:none; padding:4px; cursor:pointer; color:var(--text-muted);">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+
+      <div class="form-section">
+        <!-- 新增：历史存档图片查看区 (仅在编辑或已识别时显示) -->
+        <div id="modal-img-saved-container" style="display: none; margin-bottom: 16px; grid-column: 1 / -1;">
+          <div id="modal-img-saved"
+            style="width: 100%; height: 220px; border-radius: 12px; background: #f0f2f5 center/contain no-repeat; border: 1px solid var(--border-color); position: relative; overflow: hidden;">
+            <div
+              style="position: absolute; bottom: 0; width: 100%; background: rgba(255,255,255,0.9); display: flex; justify-content: space-between; align-items: center; padding: 6px 12px; backdrop-filter: blur(4px); border-top: 1px solid var(--border-color);">
+              <span style="color: var(--text-main); font-size: 11px; font-weight: 600;">已保存的高清标签图</span>
+              <button class="nav-item"
+                style="padding: 4px 10px; font-size: 10px; background: var(--accent-blue); color: #fff; border:none;"
+                onclick="viewFullImage()">查看大图</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 智控扫描卡片 -->
+        <input type="file" id="input-camera-native" accept="image/*" capture="environment"
+          style="position: absolute; opacity: 0; pointer-events: none; width: 0; height: 0;"
+          onchange="handleImageFile(this.files, true)">
+        <input type="file" id="input-file-native" accept="image/*"
+          style="position: absolute; opacity: 0; pointer-events: none; width: 0; height: 0;"
+          onchange="handleImageFile(this.files, true)">
+
+        <!-- OCR 识别区 -->
+        <div class="ocr-card">
+          <h3 style="font-size: 16px; font-weight: 700; color: #334155; margin: 0;">OCR识别</h3>
+
+          <div id="ocr-status-msg" style="font-size: 13px; color: var(--text-muted); margin: 8px 0; font-weight: 500;">
+            等待图片上传...</div>
+
+          <!-- 操作按钮行 -->
+          <div style="display: flex; gap: 12px;">
+            <button class="header-btn primary" onclick="document.getElementById('input-camera-native').click()"
+              style="flex: 1; padding: 10px; border-radius: 6px;">
+              拍照识别
+            </button>
+            <button class="header-btn secondary" onclick="document.getElementById('input-file-native').click()"
+              style="flex: 1; padding: 10px; border-radius: 6px; background: #94a3b8;">
+              上传图片
+            </button>
+            <button id="btn-run-ocr" class="header-btn" onclick="processOCRFromCurrent()" disabled
+              style="flex: 1; padding: 10px; border-radius: 6px; border: 1px solid var(--accent-blue); background: white; color: var(--accent-blue); opacity: 0.5;">
+              重新识别
+            </button>
+          </div>
+
+          <h4 style="font-size: 14px; font-weight: 700; color: #334155; margin-top: 8px;">阿里千问原始输出</h4>
+
+          <div id="ai-debug-container" style="display: block;">
+            <pre id="ai-raw-output"
+              style="margin: 0; padding: 12px; font-size: 13px; line-height: 1.6; background: #fafafa; border-radius: 4px; border: 1px solid #e5e7eb; color: #334155; min-height: 200px; max-height: 300px; overflow-y: auto; font-family: monospace;"></pre>
+          </div>
+
+          <!-- 图片预览区下移 -->
+          <div class="ocr-viewport"
+            style="background: white; border: 1px solid #e5e7eb; border-radius: 12px; margin-top: 10px;">
+            <video id="video-preview" style="width: 100%; height: 100%; object-fit: cover; display: none;"></video>
+            <div id="ocr-overlay" class="scanner-active-overlay" style="display: none;"></div>
+            <div id="img-preview"
+              style="width:100%; height:100%; background-size: contain; background-repeat: no-repeat; background-position: center; display: none;">
+            </div>
+          </div>
+        </div>
+
+        <!-- 表单正文 -->
+        <div class="form-field">
+          <div class="custom-select-wrapper" id="brand-wrapper">
+            <label>品牌</label>
+            <div class="input-container">
+              <input type="text" id="entry-brand" placeholder="搜索品牌或直接输入" oninput="filterDropdown('brand')"
+                onfocus="openDropdown('brand', true)" onclick="openDropdown('brand', true)"
+                onblur="delayCloseDropdown('brand')">
+              <i data-lucide="x" class="clear-icon" id="clear-brand" onclick="clearDropdownInput('brand', event)"
+                style="right: 36px; display: none;"></i>
+              <i data-lucide="chevron-down" class="dropdown-icon" onclick="toggleDropdown('brand')"
+                style="pointer-events: auto; cursor: pointer;"></i>
+            </div>
+            <ul class="custom-dropdown-options" id="dropdown-brand"></ul>
+          </div>
+        </div>
+
+        <div class="form-field">
+          <div class="custom-select-wrapper" id="type-wrapper">
+            <label>材质</label>
+            <div class="input-container">
+              <input type="text" id="entry-type" onchange="applyTypePresets()" placeholder="搜索材质或直接输入"
+                oninput="filterDropdown('type')" onfocus="openDropdown('type', true)"
+                onclick="openDropdown('type', true)" onblur="delayCloseDropdown('type')">
+              <i data-lucide="x" class="clear-icon" id="clear-type" onclick="clearDropdownInput('type', event)"
+                style="right: 36px; display: none;"></i>
+              <i data-lucide="chevron-down" class="dropdown-icon" onclick="toggleDropdown('type')"
+                style="pointer-events: auto; cursor: pointer;"></i>
+            </div>
+            <ul class="custom-dropdown-options" id="dropdown-type"></ul>
+          </div>
+        </div>
+        <div class="form-field">
+          <label>颜色 (自动转化中文)</label>
+          <input type="text" id="entry-color" placeholder="AI 自动填充或手动输入">
+        </div>
+        <div class="form-field">
+          <label>状态</label>
+          <select id="entry-status">
+            <option value="Sealed">全新未拆</option>
+            <option value="InUse">使用中</option>
+            <option value="Finished">已耗尽</option>
+          </select>
+        </div>
+        <div class="form-field">
+          <label>净重 (kg)</label>
+          <input type="number" id="entry-weight" step="0.1" placeholder="例如 1.0">
+        </div>
+        <div class="form-field">
+          <label>购买日期</label>
+          <input type="date" id="entry-purchase-date">
+        </div>
+        <div class="form-field">
+          <label>购买价格 (元)</label>
+          <input type="number" id="entry-purchase-price" step="0.01" placeholder="例如 99.00">
+        </div>
+        <div class="form-field">
+          <div class="custom-select-wrapper" id="location-wrapper">
+            <label>保存位置</label>
+            <div class="input-container">
+              <input type="text" id="entry-location" placeholder="搜索位置 or 直接输入" oninput="filterDropdown('location')"
+                onfocus="openDropdown('location', true)" onclick="openDropdown('location', true)"
+                onblur="delayCloseDropdown('location')" autocomplete="off">
+              <i data-lucide="x" class="clear-icon" id="clear-location" onclick="clearDropdownInput('location', event)"
+                style="right: 36px; display: none;"></i>
+              <i data-lucide="chevron-down" class="dropdown-icon" onclick="toggleDropdown('location')"
+                style="pointer-events: auto; cursor: pointer;"></i>
+            </div>
+            <ul class="custom-dropdown-options" id="dropdown-location"></ul>
+          </div>
+        </div>
+        <div class="form-field">
+          <div class="custom-select-wrapper" id="channel-wrapper">
+            <label>购买渠道</label>
+            <div class="input-container">
+              <input type="text" id="entry-purchase-channel" placeholder="搜索渠道或直接输入" oninput="filterDropdown('channel')"
+                onfocus="openDropdown('channel', true)" onclick="openDropdown('channel', true)"
+                onblur="delayCloseDropdown('channel')" autocomplete="off">
+              <i data-lucide="x" class="clear-icon" id="clear-channel" onclick="clearDropdownInput('channel', event)"
+                style="right: 36px; display: none;"></i>
+              <i data-lucide="chevron-down" class="dropdown-icon" onclick="toggleDropdown('channel')"
+                style="pointer-events: auto; cursor: pointer;"></i>
+            </div>
+            <ul class="custom-dropdown-options" id="dropdown-channel"></ul>
+          </div>
+        </div>
+        <div class="form-field"
+          style="grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px;">
+          <div>
+            <label>喷嘴温度 Min (°C)</label>
+            <input type="number" id="entry-nozzle-min">
+          </div>
+          <div>
+            <label>喷嘴温度 Max (°C)</label>
+            <input type="number" id="entry-nozzle-max">
+          </div>
+        </div>
+        <div class="form-field" style="grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+          <div>
+            <label>热床温度 Min (°C)</label>
+            <input type="number" id="entry-bed-min">
+          </div>
+          <div>
+            <label>热床温度 Max (°C)</label>
+            <input type="number" id="entry-bed-max">
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button onclick="closeAddModal()" class="btn-ghost" style="padding: 10px 20px;">取消</button>
+        <button id="btn-save-filament" class="btn-primary" style="padding: 10px 30px;">保存耗材</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 材质详细配置弹窗 -->
+  <div id="type-modal-v3" class="modal-overlay">
+    <div class="modal-window" style="max-width: 400px; padding: 20px;">
+      <h3 style="margin-bottom: 20px;">配置材质参数预设</h3>
+      <div class="form-field" style="margin-bottom: 12px;">
+        <label>厂家</label><select id="conf-brand" class="form-field" style="width:100%"></select>
+      </div>
+      <div class="form-field" style="margin-bottom: 12px;">
+        <label>材质类型</label><input type="text" id="conf-type-name" class="form-field" placeholder="如: PLA+">
+      </div>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+        <div class="form-field"><label>喷嘴 Min</label><input type="number" id="conf-min-nozzle"></div>
+        <div class="form-field"><label>喷嘴 Max</label><input type="number" id="conf-max-nozzle"></div>
+        <div class="form-field"><label>热床 Min</label><input type="number" id="conf-min-bed"></div>
+        <div class="form-field"><label>热床 Max</label><input type="number" id="conf-max-bed"></div>
+      </div>
+      <div style="margin-top: 24px; display: flex; gap: 12px;">
+        <button onclick="document.getElementById('type-modal-v3').style.display='none'"
+          style="flex:1; padding: 10px; background: transparent; border: 1px solid var(--border-color); color: var(--text-main);">取消</button>
+        <button onclick="saveTypeConfig()"
+          style="flex:1; padding: 10px; background: var(--accent-blue); border: none; color: white; font-weight: 600;">保存预设</button>
+      </div>
+    </div>
+  </div>
+
+  <canvas id="canvas-temp" style="display: none;"></canvas>
+
+  <!-- 全屏高清大图查看模态框 (切换为柔和浅色背景) -->
+  <div id="image-viewer-modal" class="modal-overlay"
+    style="display: none; background: rgba(255,255,255,0.98); z-index: 3000; backdrop-filter: blur(10px);">
+    <div style="position: absolute; top: 20px; left: 20px; z-index: 3010;">
+      <button class="nav-item"
+        style="background: rgba(0,0,0,0.05); color: var(--text-main); padding: 8px 16px; border: 1px solid var(--border-color); border-radius: 20px; display: flex; align-items: center; gap: 8px;"
+        onclick="closeImageModal()">
+        <i data-lucide="arrow-left" style="width: 16px;"></i> 返回
+      </button>
+    </div>
+    <div style="width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; padding: 20px;">
+      <img id="image-viewer-img" src=""
+        style="max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: var(--shadow-lg); border-radius: 4px;">
+    </div>
+  </div>
+
+  <!-- Community Startup Modal -->
+  <div id="community-modal" class="modal-overlay" style="display: none; z-index: 2000;">
+    <div class="modal-window" style="max-width: 800px;">
+      <div class="modal-header">
+        <h2 style="margin: 0; font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 8px;">
+          <i data-lucide="users" style="width: 20px; color: var(--accent-blue);"></i> 关注作者 / 加入社区
+        </h2>
+        <button onclick="closeCommunityModal()"
+          style="background:none; border:none; padding:4px; cursor:pointer; color:var(--text-muted);">
+          <i data-lucide="x"></i>
+        </button>
+      </div>
+      <div class="form-section" style="display: block;"> <!-- Block layout for full width -->
+        <p class="community-intro-text">
+          感谢您使用 FilamentPro！<br>
+          如果觉得本项目对您有帮助，麻烦点点关注和助力。您的支持是我更新的动力，欢迎给予一定的打赏！
+        </p>
+        <div class="community-grid">
+          <div class="community-item">
+            <div class="qr-container">
+              <img
+                src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://space.bilibili.com/50622066"
+                alt="Bilibili" onclick="openImageModal(this.src)">
+            </div>
+            <p>作者B站</p>
+            <span class="community-sub">在下徐胖胖</span>
+          </div>
+          <div class="community-item">
+            <div class="qr-container">
+              <img src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://v.douyin.com/iP6e1y3F/"
+                alt="Douyin" onclick="openImageModal(this.src)">
+            </div>
+            <p>作者抖音</p>
+            <span class="community-sub">在下徐胖胖</span>
+          </div>
+          <div class="community-item">
+            <div class="qr-container">
+              <img
+                src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://makerworld.com.cn/@stary19?appSharePlatform=copy"
+                alt="MakerWorld" onclick="openImageModal(this.src)">
+            </div>
+            <p>MakerWorld</p>
+            <span class="community-sub">Stary19</span>
+          </div>
+          <div class="community-item">
+            <div class="qr-container">
+              <img
+                src="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=https://github.com/starxxy/filament-manager"
+                alt="GitHub" onclick="openImageModal(this.src)">
+            </div>
+            <p>GitHub主页</p>
+            <span class="community-sub">Starxxy</span>
+          </div>
+          <div class="community-item">
+            <div class="qr-container">
+              <img src="assets/qr-alipay.jpg" alt="Alipay" onclick="openImageModal(this.src)">
+            </div>
+            <p style="color: #1677ff;">支付宝打赏</p>
+            <span class="community-sub">小胖的店</span>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer community-modal-footer">
+        <button class="btn-secondary-outline" onclick="suppressCommunityModal()">
+          <i data-lucide="eye-off" style="width: 14px; vertical-align: middle; margin-right: 4px;"></i>
+          不再弹窗提醒
+        </button>
+        <button class="btn-primary" onclick="closeCommunityModal()" style="padding: 10px 30px;">
+          关闭
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 上传进度模态框 -->
+  <div id="upload-progress-modal" class="modal-overlay"
+    style="display: none; background: rgba(0,0,0,0.5); z-index: 4000;">
+    <div class="modal-window" style="max-width: 360px; padding: 24px; text-align: center;">
+      <h3 style="margin-bottom: 16px; font-size: 16px; color: var(--text-main);">正在上传备份...</h3>
+
+      <!-- 进度条容器 -->
+      <div
+        style="width: 100%; height: 8px; background: #eee; border-radius: 4px; overflow: hidden; margin-bottom: 12px;">
+        <div id="upload-progress-bar"
+          style="width: 0%; height: 100%; background: var(--accent-blue); transition: width 0.2s;"></div>
+      </div>
+
+      <p id="upload-progress-text" style="font-size: 13px; color: var(--text-muted);">0%</p>
+      <p style="font-size: 12px; color: #999; margin-top: 8px;">请勿关闭页面</p>
+    </div>
+  </div>
+
+  <div id="version-tag"
+    style="position:fixed; bottom:5px; right:5px; font-size:10px; color:rgba(0,0,0,0.2); pointer-events:none; z-index:9999;">
+    v2.0.2-api-sync</div>
+  <script src="get-ai-settings.js?v=5"></script>
+  <script src="app.js?v=5"></script>
+  <script src="load-settings.js?v=5"></script>
+</body>
+
+</html>

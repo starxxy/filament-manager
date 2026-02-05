@@ -1,0 +1,14 @@
+{
+  "name": "filament-manager-backend",
+  "version": "1.0.9",
+  "description": "Backend server for Filament Manager with SQLite database",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "better-sqlite3": "^9.2.2",
+    "cors": "^2.8.5"
+  }
+}
