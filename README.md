@@ -29,11 +29,17 @@ FilamentPro 是一款专为 3D 打印爱好者打造的轻量级、现代化的�
 
 ## 🛠️ 安装教程 (Installation)
 
-### 方式一：Docker 安装 (推荐) 🐳
+### 方式一：一键安装 (One-Click) ⚡️
 
-最简单、最稳定的安装方式。
+只需执行一条命令即可自动配置并启动服务 (基于 Docker)。
 
-**1. 拉取镜像**
+```bash
+curl -O https://raw.githubusercontent.com/starxxy/filament-manager/main/install.sh && chmod +x install.sh && ./install.sh
+```
+
+---
+
+### 方式二：手动 Docker 安装 🐳
 ```bash
 docker pull stary19/filament-manager:latest
 ```
